@@ -4199,18 +4199,25 @@ async def handle_file_restore_upload(update: Update, context: ContextTypes.DEFAU
         tg_file = await context.bot.get_file(document.file_id)
         await tg_file.download_to_drive(download_path)
         with tarfile.open(download_path, "r:*") as tar:
+            # skip the archive's own root entry ("."): re-applying permissions/times to the
+            # volume's mount point itself is not allowed on some hosts and aborts the restore
+            members = [m for m in tar.getmembers() if m.name.strip("./") != ""]
             if hasattr(tarfile, "data_filter"):
-                tar.extractall(volume_dir, filter="data")  # refuses ../ paths, absolute paths, special files
+                tar.extractall(volume_dir, members=members, filter="data")  # refuses ../ paths, absolute paths, special files
             else:
-                tar.extractall(volume_dir)
+                tar.extractall(volume_dir, members=members)
         await update.message.reply_text(
-            "✅ Volume restored. Everything from the backup is in place now - "
-            "restart/redeploy the bot to be safe."
+            f"✅ Volume restored ({len(members)} files into <code>{html.escape(volume_dir)}</code>). "
+            "Redeploy the bot now so it loads the restored database.",
+            parse_mode=ParseMode.HTML,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to restore volume backup")
         await update.message.reply_text(
-            "⚠️ Something went wrong while restoring the backup - the volume may be partially updated."
+            "⚠️ Something went wrong while restoring the backup - the volume may be partially updated.\n"
+            f"Target: <code>{html.escape(volume_dir)}</code>\n"
+            f"Error: <code>{html.escape(type(exc).__name__)}: {html.escape(str(exc)[:300])}</code>",
+            parse_mode=ParseMode.HTML,
         )
     finally:
         try:
