@@ -387,6 +387,13 @@ def init_db():
         )
     """)
 
+    # defensive migration: where each listing's announcement lives in the shop channel
+    for col_def in ("channel_chat_id TEXT", "channel_message_id INTEGER", "channel_media_type TEXT"):
+        try:
+            cur.execute(f"ALTER TABLE market_listings ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass
+
     # ---------------- Dynamic rarity economy (/prices) ----------------
 
     cur.execute("""
@@ -2664,6 +2671,9 @@ def list_users_with_birthday_today(month: int, day: int):
     return rows
 
 
+LIVE_NAME_RESOLVER = None  # set by bot.py: callable(user_id) -> current Telegram name or None
+
+
 def get_display_name(user_id: int) -> str:
     """
     Best available human-readable name for a user: their first name
@@ -2674,6 +2684,17 @@ def get_display_name(user_id: int) -> str:
     """
     if user_id in ARENA_NPC_IDS:
         return next(n["name"] for n in ARENA_NPC_OPPONENTS if n["id"] == user_id)
+
+    # The name is read from the person's live Telegram account whenever possible
+    # (bot.py installs LIVE_NAME_RESOLVER at startup); the stored copy below is
+    # only the fallback for people Telegram won't tell us about.
+    if LIVE_NAME_RESOLVER is not None:
+        try:
+            live = LIVE_NAME_RESOLVER(user_id)
+        except Exception:
+            live = None
+        if live:
+            return live
 
     conn = get_connection()
     cur = conn.cursor()
@@ -3955,6 +3976,37 @@ def cancel_listing(listing_id: int, user_id: int) -> bool:
     conn.commit()
     conn.close()
     return True
+
+
+def set_listing_channel_post(listing_id: int, chat_id: str, message_id: int, media_type: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE market_listings SET channel_chat_id = ?, channel_message_id = ?, channel_media_type = ? WHERE id = ?",
+        (chat_id, message_id, media_type, listing_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def cancel_active_listings(character_id: int = None):
+    """Marks every active listing (of one character, or of all) as cancelled and
+    returns their ids - used when a card is deleted from the bot, so the shop
+    channel can stamp those posts EXPIRED."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("BEGIN IMMEDIATE")
+    if character_id is None:
+        cur.execute("SELECT id FROM market_listings WHERE status = 'active'")
+    else:
+        cur.execute("SELECT id FROM market_listings WHERE status = 'active' AND character_id = ?", (character_id,))
+    ids = [row["id"] for row in cur.fetchall()]
+    if ids:
+        marks = ",".join("?" * len(ids))
+        cur.execute(f"UPDATE market_listings SET status = 'cancelled' WHERE id IN ({marks})", ids)
+    conn.commit()
+    conn.close()
+    return ids
 
 
 def buy_listing(listing_id: int, buyer_id: int, buyer_username: str):

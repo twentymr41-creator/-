@@ -52,6 +52,8 @@ import config
 import database as db
 import economy
 import memories
+import market_channel
+import time as _time
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -98,7 +100,7 @@ _PERSONAL_BUTTON_GUARD_INSTALLED = False
 #     buttons are checked by role - reviewers other than the sender must be able to press them).
 # Everything else is bound to its owner automatically - see
 # _install_personal_button_guard() and _block_unowned_callbacks().
-PUBLIC_CALLBACK_PREFIXES = ("new:lang:", "new:use:")
+PUBLIC_CALLBACK_PREFIXES = ("new:lang:", "new:use:", "chbuy:")
 SELF_GUARDED_CALLBACK_PREFIXES = ("forcejoin:check:", "submit:")
 _EXEMPT_CALLBACK_PREFIXES = PUBLIC_CALLBACK_PREFIXES + SELF_GUARDED_CALLBACK_PREFIXES
 
@@ -2222,6 +2224,31 @@ async def trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.exception("Failed to DM milestone message to %s", trader_id)
 
 
+# ---------------- Live names ----------------
+# Every place that writes a person's name (admin lists, card captions, /market, the shop
+# channel, ...) goes through db.get_display_name. This resolver makes that read the CURRENT
+# name from the person's Telegram account instead of a name saved earlier. Answers are cached
+# for a while (and failures for a shorter while) so a name is not re-fetched on every message;
+# if Telegram won't tell us, the stored name is the fallback.
+_LIVE_NAME_CACHE = {}
+_LIVE_NAME_TTL = 15 * 60
+_LIVE_NAME_FAIL_TTL = 10 * 60
+
+
+def _live_name_resolver(user_id: int):
+    now = _time.time()
+    hit = _LIVE_NAME_CACHE.get(user_id)
+    if hit and now - hit[0] < (_LIVE_NAME_TTL if hit[1] else _LIVE_NAME_FAIL_TTL):
+        return hit[1]
+    name = market_channel.fetch_live_name(user_id, timeout=3.0)
+    _LIVE_NAME_CACHE[user_id] = (now, name)
+    return name
+
+
+def _channel_link() -> str:
+    return "https://t.me/" + str(config.MARKET_CHANNEL).lstrip("@")
+
+
 # ---------------- /sell (Mini App market) ----------------
 
 async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2304,10 +2331,13 @@ async def sell_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TY
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("❌ Cancel listing", callback_data=f"cancelsell:{listing_id}:{seller_id}"),
     ]])
+    # announce it in the shop channel (seller's name is read from their live account)
+    posted = await asyncio.to_thread(market_channel.post_listing, listing_id, seller)
+    channel_line = f'\n📢 Announced in <a href="{_channel_link()}">the shop channel</a>.' if posted else ""
     await _edit_text_or_caption(
         query,
         f"🛍 Listed <b>{html.escape(character['name'])}</b> (#{char_id}) for {price} {config.CURRENCY_SYMBOL} "
-        f"on the Waifu Market.\nListing ID: <code>{listing_id}</code>",
+        f"on the Waifu Market.\nListing ID: <code>{listing_id}</code>{channel_line}",
         reply_markup=keyboard,
     )
 
@@ -2328,6 +2358,7 @@ async def cancelsell_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     listing = db.get_listing_by_id(listing_id)
     success = db.cancel_listing(listing_id, update.effective_user.id)
     if success:
+        await asyncio.to_thread(market_channel.mark_expired, listing_id)
         character = db.get_character(listing["character_id"]) if listing else None
         text = "✅ Listing cancelled - the card is back in your inventory only."
         if character:
@@ -2354,11 +2385,48 @@ async def cancelsell_button_callback(update: Update, context: ContextTypes.DEFAU
     success = db.cancel_listing(listing_id, seller_id)
     await query.answer()
     if success:
+        await asyncio.to_thread(market_channel.mark_expired, listing_id)
         # This button is attached to the photo /sell posted, so the
         # message has a caption, not plain text - it must be edited as one.
         await query.edit_message_caption("✅ Listing cancelled - the card is back in your inventory only.")
     else:
         await query.edit_message_caption("❓ That listing is no longer active (already sold or cancelled).")
+
+
+# ---------------- Shop channel: "Buy" button ----------------
+
+async def channel_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The 🛒 Buy button under a listing in the shop channel."""
+    query = update.callback_query
+    listing_id = int(query.data.split(":")[1])
+    buyer = query.from_user
+
+    # the buyer's name comes from the account that pressed the button
+    db.upsert_user_profile(buyer.id, username=buyer.username,
+                           first_name=buyer.first_name, last_name=buyer.last_name)
+    result = db.buy_listing(listing_id, buyer.id, buyer.username or buyer.first_name)
+
+    if not result["ok"]:
+        reason = result["reason"]
+        text = {
+            "not_available": "❌ This card is no longer available.",
+            "own_listing": "⛔ You can't buy your own card.",
+            "insufficient_funds": f"💸 You don't have enough {config.CURRENCY_SYMBOL} for this card.",
+        }.get(reason, "❌ Purchase failed.")
+        await query.answer(text, show_alert=True)
+        return
+
+    await query.answer("✅ Purchased! The card is now in your collection.", show_alert=True)
+
+    character = db.get_character(result["character_id"])
+    if character:
+        for msg in memories.record_acquisition(buyer.id, character, "market_buy"):
+            try:
+                await context.bot.send_message(buyer.id, msg, parse_mode=ParseMode.HTML)
+            except TelegramError:
+                pass
+
+    await asyncio.to_thread(market_channel.mark_sold, listing_id, buyer.id, buyer)
 
 
 # ---------------- /sellbot (sell a card directly to the bot) ----------------
@@ -2529,8 +2597,7 @@ def build_market_page(page: int, chat_type: str = "private", bot_username: str =
     else:
         for row in page_listings:
             rarity_text = row["rarity_name"] if row["rarity_name"] else "Unranked"
-            seller = f"@{row['seller_username']}" if row["seller_username"] else f"Player {row['seller_id']}"
-            seller = format_display_name(row["seller_id"], seller)
+            seller = format_display_name(row["seller_id"], db.get_display_name(row["seller_id"]))
             lines.append(
                 f"🔹 <b>{row['name']}</b> (#{row['character_id']}) _ {rarity_text}\n"
                 f"   💰 {row['price']} {config.CURRENCY_SYMBOL} • 👤 {seller} • Listing <code>{row['listing_id']}</code>"
@@ -3445,6 +3512,9 @@ async def remove_character_command(update: Update, context: ContextTypes.DEFAULT
         if not is_admin(user.id):
             await update.message.reply_text("⛔ Only the owner can remove all characters at once.")
             return
+        expired_ids = db.cancel_active_listings()
+        for lid in expired_ids:
+            await asyncio.to_thread(market_channel.mark_expired, lid)
         db.wipe_all_characters()
         await update.message.reply_text(
             "🗑️ All characters and everyone's constellations have been wiped.\n"
@@ -3459,6 +3529,10 @@ async def remove_character_command(update: Update, context: ContextTypes.DEFAULT
         return
 
     character = db.get_character(char_id)
+    if character:
+        # shop-channel posts of this card get the red EXPIRED stamp (needs the card's image, so BEFORE deleting)
+        for lid in db.cancel_active_listings(char_id):
+            await asyncio.to_thread(market_channel.mark_expired, lid)
     if character and db.delete_character(char_id):
         if character["archive_message_id"]:
             try:
@@ -6007,6 +6081,7 @@ async def special_reply_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 def main():
     db.init_db()
+    db.LIVE_NAME_RESOLVER = _live_name_resolver
 
     threading.Thread(target=run_api_server, daemon=True).start()
     threading.Thread(target=economy.run_price_update_loop, daemon=True).start()
@@ -6141,6 +6216,7 @@ def main():
     app.add_handler(CommandHandler("sellbot", sellbot_command))
     app.add_handler(CommandHandler("setsellprice", set_sell_price_command))
     app.add_handler(CallbackQueryHandler(cancelsell_button_callback, pattern=r"^cancelsell:"))
+    app.add_handler(CallbackQueryHandler(channel_buy_callback, pattern=r"^chbuy:\d+$"))
     app.add_handler(CallbackQueryHandler(sellbot_callback, pattern=r"^sellbot:"))
     app.add_handler(CommandHandler("market", market_command))
     app.add_handler(CallbackQueryHandler(market_page_callback, pattern=r"^marketpage:"))

@@ -38,6 +38,7 @@ import config
 import chat_ai
 import database as db
 import memories
+import market_channel
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +254,10 @@ async def buy(payload: BuyRequest, user: dict = Depends(current_user)):
     if character:
         for msg in memories.record_acquisition(user["id"], character, "market_buy"):
             await _send_telegram_message(user["id"], msg)
+
+    # stamp the shop-channel post SOLD (buyer's name = the account that just bought)
+    buyer_tg = type("TgUser", (), {"first_name": user.get("first_name"), "last_name": user.get("last_name")})()
+    await asyncio.to_thread(market_channel.mark_sold, payload.listing_id, user["id"], buyer_tg)
 
     return result
 

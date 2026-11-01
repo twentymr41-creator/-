@@ -64,6 +64,11 @@ ADMIN_TYPE_BUNDLES = {
 # Channel every newly added character card gets posted to (bot must be admin there)
 ARCHIVE_CHANNEL = "@gettersArchivum"
 
+# The shop channel: every /sell listing is announced here with a Buy button
+# (see market_channel.py). The bot must be an ADMIN of this channel with the
+# "Post messages" and "Edit messages of others" rights.
+MARKET_CHANNEL = os.environ.get("MARKET_CHANNEL", "@GettersMarket")
+
 # --- Spawn settings ---
 MESSAGES_NEEDED_TO_SPAWN = 100      # messages required before a spawn
 
