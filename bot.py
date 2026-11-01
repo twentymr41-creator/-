@@ -4201,7 +4201,17 @@ async def handle_file_restore_upload(update: Update, context: ContextTypes.DEFAU
         with tarfile.open(download_path, "r:*") as tar:
             # skip the archive's own root entry ("."): re-applying permissions/times to the
             # volume's mount point itself is not allowed on some hosts and aborts the restore
-            members = [m for m in tar.getmembers() if m.name.strip("./") != ""]
+            # also skip links and code/environment folders: a backup taken of the whole app
+            # directory (not only the data volume) carries .venv, .git and the .py files, which
+            # have no place on the data volume (and absolute symlinks are refused by the safe filter)
+            skip_dirs = {".venv", "venv", ".git", "__pycache__", "node_modules", ".cache"}
+            members = [
+                m for m in tar.getmembers()
+                if m.name.strip("./") != ""
+                and (m.isfile() or m.isdir())
+                and not (skip_dirs & set(m.name.split("/")))
+                and not m.name.endswith((".py", ".pyc"))
+            ]
             if hasattr(tarfile, "data_filter"):
                 tar.extractall(volume_dir, members=members, filter="data")  # refuses ../ paths, absolute paths, special files
             else:
