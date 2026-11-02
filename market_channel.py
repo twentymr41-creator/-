@@ -47,11 +47,29 @@ def _api(method: str, data: dict = None, files: dict = None):
         body = r.json()
         if not body.get("ok"):
             logger.warning("Market channel: %s failed: %s", method, body.get("description"))
+            if method in _REPORTED_METHODS:
+                _notify_admin(f"⚠️ Shop channel: <code>{method}</code> failed:\n"
+                              f"<code>{html.escape(str(body.get('description')))}</code>")
             return None
         return body["result"]
-    except Exception:
+    except Exception as exc:
         logger.exception("Market channel: %s crashed", method)
+        if method in _REPORTED_METHODS:
+            _notify_admin(f"⚠️ Shop channel: <code>{method}</code> crashed:\n"
+                          f"<code>{html.escape(type(exc).__name__)}: {html.escape(str(exc)[:200])}</code>")
         return None
+
+
+_REPORTED_METHODS = {"sendPhoto", "sendVideo", "editMessageMedia", "editMessageCaption"}
+
+
+def _notify_admin(text: str):
+    """DMs the bot owner, so a failing channel never goes unnoticed (no log digging needed)."""
+    try:
+        httpx.post(f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage",
+                   data={"chat_id": config.ADMIN_ID, "text": text, "parse_mode": "HTML"}, timeout=_TIMEOUT)
+    except Exception:
+        logger.exception("Market channel: could not notify the admin")
 
 
 def _download_file(file_id: str):
@@ -269,8 +287,12 @@ def post_listing(listing_id: int, seller_tg_user=None) -> bool:
 
 def _finish(listing_id: int, state: str, buyer_id=None, buyer_tg_user=None) -> bool:
     listing, character, rarity_name = _load(listing_id)
-    if not listing or not listing["channel_message_id"]:
-        return False                                   # never posted (older listing / channel was down)
+    if not listing:
+        return False
+    if not listing["channel_message_id"]:               # never posted (older listing / channel was down)
+        _notify_admin(f"ℹ️ Shop channel: listing <code>{listing_id}</code> became <b>{state}</b>, "
+                      "but it has no channel post recorded, so nothing was stamped.")
+        return False
     chat_id, msg_id = listing["channel_chat_id"], listing["channel_message_id"]
 
     seller_name = live_name(listing["seller_id"])
@@ -285,12 +307,16 @@ def _finish(listing_id: int, state: str, buyer_id=None, buyer_tg_user=None) -> b
     original = None
     if character and listing["channel_media_type"] != "video":
         original = _download_file(character["image_file_id"])
+        if not original:
+            _notify_admin(f"⚠️ Shop channel: could not download the card image for listing <code>{listing_id}</code>.")
 
     if original:
         try:
             stamped = stamp_image(original, state)
         except Exception:
             logger.exception("Market channel: stamping failed for listing %s", listing_id)
+            _notify_admin(f"⚠️ Shop channel: could not draw the stamp for listing <code>{listing_id}</code> "
+                          "(see the deploy logs: 'stamping failed').")
             stamped = None
         if stamped:
             import json
