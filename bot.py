@@ -29,8 +29,12 @@ from telegram import (
     Bot,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
     InlineQueryResultCachedPhoto,
     InlineQueryResultCachedVideo,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputTextMessageContent,
     LinkPreviewOptions,
     WebAppInfo,
 )
@@ -354,9 +358,14 @@ async def _block_non_members(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     parse_mode=ParseMode.HTML,
                     reply_markup=_force_join_markup(settings, user.id),
                 )
-            else:
+            elif update.callback_query.message is not None:
                 await update.callback_query.message.reply_text(
                     notice, parse_mode=ParseMode.HTML, reply_markup=_force_join_markup(settings, user.id)
+                )
+            else:  # button on an inline-mode message (no chat to reply into): ask privately
+                await context.bot.send_message(
+                    chat_id=user.id, text=notice, parse_mode=ParseMode.HTML,
+                    reply_markup=_force_join_markup(settings, user.id),
                 )
         elif update.effective_message:
             await update.effective_message.reply_text(
@@ -3009,7 +3018,288 @@ async def capture_sort_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-async def constellation_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------- Inline commands (use the bot inside ANY chat) ----------------
+# Telegram bots cannot read what people write in a private chat they are not part of, so
+# commands are used through inline mode:  "@bot /gift 12"  in the chat box. The bot answers
+# with a result; tapping it posts a message (via the bot) into that chat and the rest of the
+# flow runs on that message's buttons. Plain "@bot something" keeps working as the gallery.
+
+_INLINE_DONE = set()  # inline messages whose confirm/accept button has already been used
+
+
+def _inline_claim(inline_message_id: str) -> bool:
+    """True the first time a given inline message is acted on (guards double taps)."""
+    if inline_message_id in _INLINE_DONE:
+        return False
+    _INLINE_DONE.add(inline_message_id)
+    if len(_INLINE_DONE) > 5000:
+        _INLINE_DONE.clear()
+    return True
+
+
+def _inline_article(result_id: str, title: str, text: str, description: str = None, reply_markup=None):
+    return InlineQueryResultArticle(
+        id=result_id, title=title, description=description,
+        input_message_content=InputTextMessageContent(text, parse_mode=ParseMode.HTML),
+        reply_markup=reply_markup,
+    )
+
+
+def _inline_card_result(result_id: str, character, caption: str, reply_markup=None):
+    kwargs = dict(id=result_id, title=character["name"], caption=caption,
+                  parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    if (character["media_type"] or "photo") == "video":
+        return InlineQueryResultCachedVideo(video_file_id=character["image_file_id"], **kwargs)
+    return InlineQueryResultCachedPhoto(photo_file_id=character["image_file_id"], **kwargs)
+
+
+def _open_bot_markup(bot_username: str, label: str = "Open the bot"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, url=f"https://t.me/{bot_username}")]])
+
+
+async def _edit_inline_message(context, inline_message_id: str, text: str, character=None):
+    """Replaces an inline-mode message's caption/text and removes its buttons."""
+    try:
+        await context.bot.edit_message_caption(
+            inline_message_id=inline_message_id, caption=text, parse_mode=ParseMode.HTML, reply_markup=None
+        )
+    except TelegramError:
+        try:
+            await context.bot.edit_message_text(
+                inline_message_id=inline_message_id, text=text, parse_mode=ParseMode.HTML, reply_markup=None
+            )
+        except TelegramError:
+            logger.exception("Could not edit inline message")
+
+
+async def inline_query_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """'@bot /command args' runs a command; anything else is the card gallery/search."""
+    inline = update.inline_query
+    text = (inline.query or "").strip()
+    if not text.startswith("/"):
+        await constellation_inline_query(update, context)
+        return
+
+    user = inline.from_user
+    bot_username = context.bot.username
+
+    # same gates the normal commands have: bans and the force-join group
+    if not is_admin(user.id) and db.get_ban(user.id):
+        await inline.answer([_inline_article("banned", "🚫 You're banned", "🚫 You're banned from this bot.")],
+                            cache_time=1, is_personal=True)
+        return
+    if await _force_join_required(update, context):
+        await inline.answer(
+            [_inline_article("join", "🔒 Join the required group first",
+                             "🔒 Join the required group to use the bot, then try again.",
+                             reply_markup=_open_bot_markup(bot_username))],
+            cache_time=1, is_personal=True)
+        return
+
+    parts = text[1:].split()
+    command = parts[0].split("@")[0].lower() if parts else ""
+    args = parts[1:]
+    results = []
+
+    def usage(cmd_usage: str, hint: str):
+        return [_inline_article(f"usage:{command}", f"Usage: {cmd_usage}", f"⚠️ Usage: <code>{html.escape(cmd_usage)}</code>\n{hint}")]
+
+    if command in ("gift", "trade", "check"):
+        if not args or not args[0].isdigit():
+            results = usage(f"@{bot_username} /{command} [ID]", "ID is the number shown on the card.")
+        else:
+            char_id = int(args[0])
+            character = db.get_character(char_id)
+            if not character or not character["image_file_id"]:
+                results = [_inline_article("nochar", f"❓ No card with ID #{char_id}", f"❓ No character found with ID #{char_id}.")]
+            elif command == "check":
+                caption = build_card_caption(character, db.count_owners(char_id))
+                results = [_inline_card_result(f"check:{char_id}", character, caption)]
+            elif not db.user_owns_character(user.id, char_id):
+                results = [_inline_article("notowned", f"❓ You don't own #{char_id}", "❓ You don't own that card.")]
+            elif command == "gift":
+                caption = (f"🎁 {_mention(user.id, user.full_name)} wants to gift you "
+                           f"<b>{html.escape(character['name'])}</b> (#{char_id})!")
+                markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🎁 Accept gift", callback_data=f"igift:ok:{user.id}:{char_id}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"igift:no:{user.id}:{char_id}"),
+                ]])
+                results = [_inline_card_result(f"gift:{user.id}:{char_id}", character, caption, markup)]
+            else:  # trade
+                if not db.is_premium(user.id):
+                    results = [_inline_article("nopremium", "⭐️ /trade is a premium perk",
+                                               "⭐️ <code>/trade</code> is a premium perk. Check <code>/premium</code>.")]
+                elif not character["rarity_id"]:
+                    results = [_inline_article("norarity", "❓ That card has no rarity", "❓ That card has no rarity set, so it can't be traded.")]
+                else:
+                    rarity_display = character["rarity_name"] or "Unranked"
+                    caption = (f"🔄 Trade <b>{html.escape(character['name'])}</b> (#{char_id}, {html.escape(rarity_display)}) "
+                               f"for a random <b>{html.escape(rarity_display)}</b> character? This can't be undone.")
+                    markup = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ Confirm", callback_data=f"itrade:ok:{user.id}:{char_id}"),
+                        InlineKeyboardButton("❌ Cancel", callback_data=f"itrade:no:{user.id}:{char_id}"),
+                    ]])
+                    results = [_inline_card_result(f"trade:{user.id}:{char_id}", character, caption, markup)]
+
+    elif command == "top":
+        mode = args[0].lower() if args else None
+        if mode not in (None, "vy", "collection"):
+            results = usage(f"@{bot_username} /top [vy|collection]", "")
+        else:
+            for m, label in (("vy", "💰 Richest players"), ("collection", "🗂 Biggest collections")):
+                if mode in (None, m):
+                    results.append(_inline_article(f"top:{m}", label, _build_top_text(m),
+                                                   reply_markup=_open_bot_markup(bot_username)))
+
+    elif command == "market":
+        page_text, _keyboard = build_market_page(0, "private", bot_username)
+        results = [_inline_article("market", "🛍 Waifu Market", page_text, "First page of the market",
+                                   reply_markup=_open_bot_markup(bot_username, "🛍 Open the market"))]
+
+    elif command in ("constellation", "gallery", "search"):
+        # reuse the gallery: rewrite the query and let that handler build the photo results
+        if command == "search" and not args:
+            await inline.answer(usage(f"@{bot_username} /search [name / rarity / event]", ""), cache_time=1, is_personal=True)
+            return
+        rewritten = {
+            "constellation": f"constellation:{user.id}",
+            "gallery": "gallery:",
+            "search": " ".join(args),
+        }[command]
+        await constellation_inline_query(update, context, query_override=rewritten)
+        return
+
+    elif command in KNOWN_COMMANDS:
+        results = [_inline_article(
+            f"open:{command}", f"/{command} — use it in the bot",
+            f"ℹ️ <code>/{html.escape(command)}</code> needs the bot's own chat: open it and send the command there.",
+            "This command can't run inside another chat",
+            reply_markup=_open_bot_markup(bot_username))]
+    else:
+        results = usage(f"@{bot_username} /gift [ID]",
+                        "Also: /trade [ID], /check [ID], /top, /market, /constellation, /gallery, /search [text]")
+
+    await inline.answer(results, cache_time=1, is_personal=True)
+
+
+async def inline_gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buttons of a '@bot /gift ID' message: the other person accepts, the giver can cancel."""
+    query = update.callback_query
+    inline_id = query.inline_message_id
+    _, action, giver_raw, char_raw = query.data.split(":")
+    giver_id, char_id = int(giver_raw), int(char_raw)
+    presser = query.from_user
+
+    if not inline_id:
+        await query.answer("This gift message is no longer usable.", show_alert=True)
+        return
+
+    if action == "no":
+        if presser.id != giver_id:
+            await query.answer("Only the gifter can cancel this.", show_alert=True)
+            return
+        if not _inline_claim(inline_id):
+            await query.answer()
+            return
+        await query.answer()
+        await _edit_inline_message(context, inline_id, "❌ Gift cancelled.")
+        return
+
+    if presser.id == giver_id:
+        await query.answer("😅 You can't gift a card to yourself - the other person has to accept it.", show_alert=True)
+        return
+    if presser.is_bot:
+        await query.answer()
+        return
+    if not _inline_claim(inline_id):
+        await query.answer("This gift was already handled.", show_alert=True)
+        return
+
+    # names come from the accounts themselves
+    db.upsert_user_profile(presser.id, username=presser.username,
+                           first_name=presser.first_name, last_name=presser.last_name)
+    character = db.get_character(char_id)
+    ok = db.gift_character(giver_id, presser.id, presser.username or presser.first_name, char_id)
+    await query.answer()
+    if not ok or not character:
+        await _edit_inline_message(context, inline_id, "❓ The gifter no longer owns that card.")
+        return
+
+    giver_name = db.get_display_name(giver_id)
+    await _edit_inline_message(
+        context, inline_id,
+        f"🎁 <b>{html.escape(character['name'])}</b> gifted by {_mention(giver_id, giver_name)} "
+        f"to {_mention(presser.id, presser.full_name)}!",
+    )
+    for msg in memories.record_acquisition(presser.id, character, "gift_received"):
+        try:
+            await context.bot.send_message(chat_id=presser.id, text=msg, parse_mode=ParseMode.HTML)
+        except Exception:
+            logger.exception("Failed to DM milestone message to %s", presser.id)
+
+
+async def inline_trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buttons of a '@bot /trade ID' message (only the trader can use them)."""
+    query = update.callback_query
+    inline_id = query.inline_message_id
+    _, action, trader_raw, char_raw = query.data.split(":")
+    trader_id, char_id = int(trader_raw), int(char_raw)
+
+    if query.from_user.id != trader_id:
+        await query.answer("Only the person who started this trade can use these buttons.", show_alert=True)
+        return
+    if not inline_id:
+        await query.answer("This trade message is no longer usable.", show_alert=True)
+        return
+    if not _inline_claim(inline_id):
+        await query.answer()
+        return
+
+    if action == "no":
+        await query.answer()
+        await _edit_inline_message(context, inline_id, "❌ Trade cancelled.")
+        return
+
+    if not db.is_premium(trader_id):
+        await query.answer()
+        await _edit_inline_message(context, inline_id, "⭐️ Premium is required for /trade.")
+        return
+
+    character = db.get_character(char_id)
+    replacement = db.get_random_character_in_rarity_excluding(character["rarity_id"], char_id) if character else None
+    if not character or not replacement:
+        await query.answer()
+        await _edit_inline_message(context, inline_id, "❓ There's no other character in that rarity to trade for right now.")
+        return
+
+    if not db.sell_character_to_bot(trader_id, char_id):
+        await query.answer()
+        await _edit_inline_message(context, inline_id, "❓ You no longer own a free copy of that card (maybe it's listed on the market).")
+        return
+
+    db.give_character_to_user(trader_id, query.from_user.username or query.from_user.first_name, replacement["id"])
+    await query.answer()
+
+    caption = (f"🔄 {_mention(trader_id, query.from_user.full_name)} traded <b>{html.escape(character['name'])}</b> "
+               f"for <b>{html.escape(replacement['name'])}</b> ({html.escape(replacement['rarity_name'] or 'Unranked')})!")
+    media_cls = InputMediaVideo if (replacement["media_type"] or "photo") == "video" else InputMediaPhoto
+    try:  # show the new card itself
+        await context.bot.edit_message_media(
+            inline_message_id=inline_id,
+            media=media_cls(media=replacement["image_file_id"], caption=caption, parse_mode=ParseMode.HTML),
+            reply_markup=None,
+        )
+    except TelegramError:
+        await _edit_inline_message(context, inline_id, caption)
+
+    for msg in memories.record_acquisition(trader_id, replacement, "trade"):
+        try:
+            await context.bot.send_message(chat_id=trader_id, text=msg, parse_mode=ParseMode.HTML)
+        except Exception:
+            logger.exception("Failed to DM milestone message to %s", trader_id)
+
+
+async def constellation_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE, query_override: str = None):
     """
     Powers the inline gallery:
     - '🌌 See constellation' button -> '@yourbot constellation:<owner_id>'
@@ -3021,7 +3311,7 @@ async def constellation_inline_query(update: Update, context: ContextTypes.DEFAU
     Returns a scrollable native Telegram photo gallery - nothing gets posted in
     the chat itself unless the person taps a specific photo to send it.
     """
-    query_text = (update.inline_query.query or "").strip()
+    query_text = (query_override if query_override is not None else (update.inline_query.query or "")).strip()
 
     owner_id = None
     counts = {}
@@ -6237,7 +6527,9 @@ def main():
     app.add_handler(CallbackQueryHandler(sellbot_callback, pattern=r"^sellbot:"))
     app.add_handler(CommandHandler("market", market_command))
     app.add_handler(CallbackQueryHandler(market_page_callback, pattern=r"^marketpage:"))
-    app.add_handler(InlineQueryHandler(constellation_inline_query))
+    app.add_handler(InlineQueryHandler(inline_query_router))
+    app.add_handler(CallbackQueryHandler(inline_gift_callback, pattern=r"^igift:"))
+    app.add_handler(CallbackQueryHandler(inline_trade_callback, pattern=r"^itrade:"))
 
     # separate group: only acts when a /sort prompt is waiting on this user,
     # otherwise does nothing - runs independently of the group message counter
