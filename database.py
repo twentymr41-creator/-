@@ -185,6 +185,14 @@ def init_db():
         )
     """)
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS tag_word_counts (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            count INTEGER DEFAULT 0,
+            PRIMARY KEY (chat_id, user_id)
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS tttp_premium_runs (
             run_date TEXT PRIMARY KEY,
             ran_at TEXT
@@ -2558,6 +2566,33 @@ def add_currency(user_id: int, amount: int) -> int:
     row = cur.fetchone()
     conn.close()
     return row["balance"]
+
+
+# ---------------- "تگ" word counter ----------------
+
+def register_tag_word(chat_id: int, user_id: int, limit: int = 3) -> bool:
+    """
+    Counts one "تگ" message from this user in this chat. The count survives
+    other messages and restarts. When it reaches `limit` it is reset to 0 and
+    True is returned (time for the bot to answer); otherwise False.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("""
+            INSERT INTO tag_word_counts (chat_id, user_id, count) VALUES (?, ?, 1)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET count = count + 1
+        """, (chat_id, user_id))
+        cur.execute("SELECT count FROM tag_word_counts WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+        count = cur.fetchone()["count"]
+        triggered = count >= limit
+        if triggered:
+            cur.execute("UPDATE tag_word_counts SET count = 0 WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+        conn.commit()
+        return triggered
+    finally:
+        conn.close()
 
 
 # ---------------- tttp (artist currency) ----------------

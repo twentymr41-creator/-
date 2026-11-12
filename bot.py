@@ -6500,6 +6500,35 @@ async def special_reply_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await message.reply_text(reply)
 
 
+TAG_WORD = "تگ"
+TAG_WORD_LIMIT = 3
+TAG_WORD_REPLY = "نکن دیگه مشتی گاییدی😐"
+
+
+def _is_tag_word(text: str) -> bool:
+    """True when the whole message is just the word تگ (ignoring spaces, punctuation and ZWNJ)."""
+    cleaned = text.replace("\u200c", "").replace("ك", "ک").strip(" \t\n.!؟?،,…~-_")
+    return cleaned == TAG_WORD
+
+
+async def tag_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Counts each user's "تگ" messages (other messages in between don't matter).
+    On the 3rd one the bot sends TAG_WORD_REPLY and the count resets. Before
+    that it stays completely silent. Own handler group, so it never affects
+    any other flow.
+    """
+    message = update.message
+    user = update.effective_user
+    chat = update.effective_chat
+    if message is None or user is None or chat is None or user.is_bot or not message.text:
+        return
+    if not _is_tag_word(message.text):
+        return
+    if db.register_tag_word(chat.id, user.id, TAG_WORD_LIMIT):
+        await message.reply_text(TAG_WORD_REPLY)
+
+
 def main():
     db.init_db()
     db.LIVE_NAME_RESOLVER = _live_name_resolver
@@ -6664,6 +6693,9 @@ def main():
 
     # its own group - only answers the special person's (and the owner's) fixed trigger messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, special_reply_handler), group=6)
+
+    # its own group - only counts messages that are exactly the word تگ
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tag_word_handler), group=7)
 
     logger.info("Bot starting...")
     KNOWN_COMMANDS.update(
