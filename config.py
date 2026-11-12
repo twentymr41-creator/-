@@ -101,6 +101,37 @@ PREMIUM_DAILY_TASK_BONUS = 50       # same, for premium players
 # Unit symbol appended after every currency amount shown to players.
 CURRENCY_SYMBOL = "VɎ"
 
+# ==================== tttp - the artist currency ====================
+# A second currency earned only by admins who add cards. 1 tttp is worth
+# TTTP_VALUE_IN_VY of the public currency (VY). Wherever VY can be spent,
+# sent or given, tttp works too; when buying, tttp is spent first.
+TTTP_SYMBOL = "tttp"
+TTTP_VALUE_IN_VY = 20
+
+# tttp an admin earns for every card they add (/addcharacter, or an approved
+# /send), by rarity tier. Keys are the canonical tier names from
+# RARITY_BASE_PRICES, so "🟡Legendary" / "legendary" etc. all match.
+TTTP_RARITY_REWARDS = {
+    "Common": 1,
+    "Rare": 1,
+    "Mystic": 1,
+    "Legendary": 1,
+    "Elysian": 2,
+    "Prismatic": 3,
+    "Nocturne": 4,
+    "Ethereal": 5,
+    "Sovereign": 6,
+    "Aevoria": 3,
+    "Celestial": 8,
+    "Singular": 9,
+    "Omnara": 15,
+}
+
+# An admin who earns at least this much tttp (from adding cards) during one
+# Iran-time day is given 24h premium at 00:00 Iran time. The cycle repeats
+# every night as long as they keep hitting the target.
+TTTP_PREMIUM_DAILY_THRESHOLD = 10
+
 # --- Mini App / Market API ---
 # The Waifu Market Mini App's deployed URL (e.g. https://waifu-market.vercel.app),
 # once you have one. Locks down the API's CORS to just that origin instead

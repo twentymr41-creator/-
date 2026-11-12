@@ -55,6 +55,7 @@ from telegram.ext import (
 import config
 import database as db
 import economy
+import tttp
 import memories
 import market_channel
 import time as _time
@@ -238,6 +239,34 @@ def has_command_permission(user_id: int, permission: str) -> bool:
     """Owner always passes; anyone else needs this specific permission
     (see config.ADMIN_PERMISSIONS) granted via /admin or /addadmin."""
     return is_admin(user_id) or db.has_permission(user_id, permission)
+
+
+def _is_any_admin(user_id: int) -> bool:
+    """The owner or a secondary admin holding at least one permission."""
+    return is_admin(user_id) or bool(db.get_permissions(user_id))
+
+
+def award_artist_tttp(user_id: int, rarity_name):
+    """
+    Pays tttp to whoever added a card, if they're any kind of admin, based on
+    the card's rarity. Returns (reward, new_balance, earned_today) or None
+    when nothing was paid (not an admin / unranked / custom rarity).
+    """
+    if not user_id or not _is_any_admin(user_id):
+        return None
+    reward = tttp.reward_for_rarity(rarity_name)
+    if reward <= 0:
+        return None
+    balance, earned_today = db.reward_tttp_for_card(user_id, reward)
+    return reward, balance, earned_today
+
+
+def _tttp_reward_text(award) -> str:
+    reward, balance, earned_today = award
+    return (
+        f"🎨 +{reward} {config.TTTP_SYMBOL} (balance: {balance})\n"
+        f"📅 Earned today: {earned_today}/{config.TTTP_PREMIUM_DAILY_THRESHOLD} for tonight's premium"
+    )
 
 
 def _volume_dir() -> str:
@@ -1141,6 +1170,7 @@ INVENTORY_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 async def inventory_currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     balance = db.get_currency(user.id)
+    tttp_balance = db.get_tttp(user.id)
     card_count = len(db.get_user_inventory(user.id, apply_filter=False))
     rank = db.get_richest_rank(user.id)
     rank_text = f"#{rank}" if rank else "—"
@@ -1154,6 +1184,9 @@ async def inventory_currency_command(update: Update, context: ContextTypes.DEFAU
         "",
         f"       💰 {_bold_sans(f'{balance:,}')} {config.CURRENCY_SYMBOL}",
         f"          {_bold_sans('BALANCE')}",
+        "",
+        f"       🎨 {_bold_sans(f'{tttp_balance:,}')} {config.TTTP_SYMBOL}",
+        f"          {_bold_sans('ARTIST CURRENCY')}",
         "",
         f"       🎴 {_bold_sans(f'{card_count:,}')}",
         f"          {_bold_sans('CARDS')}",
@@ -1172,14 +1205,14 @@ async def inventory_currency_command(update: Update, context: ContextTypes.DEFAU
 async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message:
         await update.message.reply_text(
-            "⚠️ Reply to the person you want to pay, using <code>/vypay [amount]</code>",
+            "⚠️ Reply to the person you want to pay, using <code>/vypay [amount]</code> or <code>/vypay [amount] tttp</code>",
             parse_mode=ParseMode.HTML,
         )
         return
 
     if not context.args:
         await update.message.reply_text(
-            "⚠️ Usage: <code>/vypay [amount]</code> (as a reply to the recipient)",
+            "⚠️ Usage: <code>/vypay [amount]</code> or <code>/vypay [amount] tttp</code> (as a reply to the recipient)",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1205,14 +1238,26 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🤖 You can't pay a bot.")
         return
 
-    if db.get_currency(sender.id) < amount:
-        await update.message.reply_text("ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴇɴᴏᴜɢʜ VɎ")
+    currency = context.args[1].lower() if len(context.args) > 1 else "vy"
+    if currency not in ("vy", config.TTTP_SYMBOL):
+        await update.message.reply_text(
+            "⚠️ Currency must be <code>vy</code> or <code>tttp</code>.", parse_mode=ParseMode.HTML
+        )
+        return
+    is_tttp = currency == config.TTTP_SYMBOL
+    symbol = config.TTTP_SYMBOL if is_tttp else config.CURRENCY_SYMBOL
+    balance = db.get_tttp(sender.id) if is_tttp else db.get_currency(sender.id)
+
+    if balance < amount:
+        await update.message.reply_text(f"ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴇɴᴏᴜɢʜ {symbol}")
         return
 
+    # vy keeps the original callback format; tttp adds a trailing ":tttp"
+    callback_ok = f"pay:ok:{sender.id}:{recipient.id}:{amount}" + (":tttp" if is_tttp else "")
     await _send_confirmation(
         update, context, None,
-        f"💸 Send <b>{amount} {config.CURRENCY_SYMBOL}</b> to {_mention(recipient.id, recipient.first_name)}?",
-        f"pay:ok:{sender.id}:{recipient.id}:{amount}", f"pay:cancel:{sender.id}",
+        f"💸 Send <b>{amount} {symbol}</b> to {_mention(recipient.id, recipient.first_name)}?",
+        callback_ok, f"pay:cancel:{sender.id}",
     )
 
 
@@ -1236,11 +1281,16 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     recipient_id, amount = int(parts[3]), int(parts[4])
-    remaining = db.transfer_currency(sender_id, recipient_id, amount)
+    is_tttp = len(parts) > 5 and parts[5] == "tttp"
+    symbol = config.TTTP_SYMBOL if is_tttp else config.CURRENCY_SYMBOL
+    if is_tttp:
+        remaining = db.transfer_tttp(sender_id, recipient_id, amount)
+    else:
+        remaining = db.transfer_currency(sender_id, recipient_id, amount)
     await query.answer()
 
     if remaining is None:
-        await _edit_text_or_caption(query, "ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴇɴᴏᴜɢʜ VɎ")
+        await _edit_text_or_caption(query, f"ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴇɴᴏᴜɢʜ {symbol}")
         return
 
     try:
@@ -1253,8 +1303,8 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query,
         "‌-------------💎ᴛʀᴀɴꜱꜰᴇʀ ᴄᴏᴍᴘʟᴇᴛᴇᴅ💎-------------\n\n"
         f"👝ʀᴇᴄᴇɪᴠᴇʀ:{recipient_name}\n"
-        f"💲ᴀᴍᴏᴜɴᴛ:{amount} {config.CURRENCY_SYMBOL}\n"
-        f"💰ʟᴇꜰᴛ:{remaining} {config.CURRENCY_SYMBOL}",
+        f"💲ᴀᴍᴏᴜɴᴛ:{amount} {symbol}\n"
+        f"💰ʟᴇꜰᴛ:{remaining} {symbol}",
     )
 
 
@@ -1388,14 +1438,15 @@ async def give_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ Reply to the person you want to give to, using:\n"
             "<code>/give [card ID]</code> for a card\n"
-            "<code>/give [amount] vy</code> for currency",
+            "<code>/give [amount] vy</code> for currency\n"
+            "<code>/give [amount] tttp</code> for artist currency",
             parse_mode=ParseMode.HTML,
         )
         return
 
     if not context.args:
         await update.message.reply_text(
-            "⚠️ Usage: <code>/give [ID]</code> or <code>/give [amount] vy</code> (as a reply to the recipient)",
+            "⚠️ Usage: <code>/give [ID]</code>, <code>/give [amount] vy</code> or <code>/give [amount] tttp</code> (as a reply to the recipient)",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1417,7 +1468,17 @@ async def give_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     is_currency = len(context.args) > 1 and context.args[1].lower() == "vy"
+    is_tttp = len(context.args) > 1 and context.args[1].lower() == config.TTTP_SYMBOL
     recipient_name = _mention(recipient.id, recipient.first_name)
+
+    if is_tttp:
+        new_balance = db.add_tttp(recipient.id, value)
+        await update.message.reply_text(
+            f"🎨 Gave <b>{value} {config.TTTP_SYMBOL}</b> to {recipient_name}.\n"
+            f"💰 Their new balance: <b>{new_balance} {config.TTTP_SYMBOL}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
     if is_currency:
         new_balance = db.add_currency(recipient.id, value)
@@ -1449,6 +1510,7 @@ def _top_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("💎 VɎ", callback_data="top:vy"),
+            InlineKeyboardButton("🎨 tttp", callback_data="top:tttp"),
             InlineKeyboardButton("🎴 Collection", callback_data="top:collection"),
         ]
     ])
@@ -1473,6 +1535,16 @@ def _build_top_text(mode: str) -> str:
             lines.append(f"{rank:>2}. {_format_top_name(row['user_id'])} — <b>{row['balance']:,} VɎ</b>")
         return "\n".join(lines)
 
+    if mode == "tttp":
+        rows = db.get_top_tttp(limit=10)
+        title = "🎨 𝗧𝗢𝗣 𝟭𝟬 — 𝘁𝘁𝘁𝗽"
+        if not rows:
+            return f"╔══════════════════════════╗\n║     {title}     ║\n╚══════════════════════════╝\n\nNo players have tttp yet."
+        lines = ["╔══════════════════════════╗", f"║     {title}     ║", "╚══════════════════════════╝", ""]
+        for rank, row in enumerate(rows, 1):
+            lines.append(f"{rank:>2}. {_format_top_name(row['user_id'])} — <b>{row['tttp_balance']:,} tttp</b>")
+        return "\n".join(lines)
+
     rows = db.get_top_collectors(limit=10)
     title = "🎴 𝗧𝗢𝗣 𝟭𝟬 — 𝗖𝗢𝗟𝗟𝗘𝗖𝗧𝗜𝗢𝗡"
     if not rows:
@@ -1488,9 +1560,9 @@ def _build_top_text(mode: str) -> str:
 async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.args[0].lower() if context.args else None
 
-    if mode not in (None, "vy", "collection"):
+    if mode not in (None, "vy", "tttp", "collection"):
         await update.message.reply_text(
-            "⚠️ Usage: <code>/top</code>, <code>/top vy</code> or <code>/top collection</code>",
+            "⚠️ Usage: <code>/top</code>, <code>/top vy</code>, <code>/top tttp</code> or <code>/top collection</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1515,7 +1587,7 @@ async def top_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     mode = query.data.split(":", 1)[1]
-    if mode not in ("vy", "collection"):
+    if mode not in ("vy", "tttp", "collection"):
         return
 
     await query.edit_message_text(
@@ -1533,6 +1605,8 @@ def _player_menu_keyboard():
         [InlineKeyboardButton("➖ Remove character", callback_data="padmin:remove_char")],
         [InlineKeyboardButton(f"💰 Give {config.CURRENCY_SYMBOL}", callback_data="padmin:give_money")],
         [InlineKeyboardButton(f"💸 Take {config.CURRENCY_SYMBOL}", callback_data="padmin:take_money")],
+        [InlineKeyboardButton(f"🎨 Give {config.TTTP_SYMBOL}", callback_data="padmin:give_tttp")],
+        [InlineKeyboardButton(f"🎨 Take {config.TTTP_SYMBOL}", callback_data="padmin:take_tttp")],
         [InlineKeyboardButton("✅ Done", callback_data="padmin:done")],
     ])
 
@@ -1612,6 +1686,8 @@ async def player_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "remove_char": "✏️ Send the character ID to remove from their collection:",
         "give_money": f"✏️ Send the amount of {config.CURRENCY_SYMBOL} to give them:",
         "take_money": f"✏️ Send the amount of {config.CURRENCY_SYMBOL} to take from them:",
+        "give_tttp": f"✏️ Send the amount of {config.TTTP_SYMBOL} to give them:",
+        "take_tttp": f"✏️ Send the amount of {config.TTTP_SYMBOL} to take from them:",
     }
     context.user_data["player_awaiting_action"] = action
     await query.edit_message_text(prompts[action])
@@ -1702,11 +1778,19 @@ async def capture_player_input(update: Update, context: ContextTypes.DEFAULT_TYP
         if action == "give_money":
             new_balance = db.add_currency(target_id, amount)
             result_text = f"✅ Gave {amount} {config.CURRENCY_SYMBOL}. New balance: <b>{new_balance} {config.CURRENCY_SYMBOL}</b>."
-        else:
+        elif action == "take_money":
             current = db.get_currency(target_id)
             taken = min(amount, current)
             new_balance = db.add_currency(target_id, -taken)
             result_text = f"✅ Took {taken} {config.CURRENCY_SYMBOL}. New balance: <b>{new_balance} {config.CURRENCY_SYMBOL}</b>."
+        elif action == "give_tttp":
+            new_balance = db.add_tttp(target_id, amount)
+            result_text = f"✅ Gave {amount} {config.TTTP_SYMBOL}. New balance: <b>{new_balance} {config.TTTP_SYMBOL}</b>."
+        else:  # take_tttp
+            current = db.get_tttp(target_id)
+            taken = min(amount, current)
+            new_balance = db.add_tttp(target_id, -taken)
+            result_text = f"✅ Took {taken} {config.TTTP_SYMBOL}. New balance: <b>{new_balance} {config.TTTP_SYMBOL}</b>."
 
     is_character_action = action in ("add_char", "remove_char")
 
@@ -2122,6 +2206,11 @@ async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def http_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/http - explains the tttp artist currency and the daily premium."""
+    await update.message.reply_text(tttp.format_info_message(), parse_mode=ParseMode.HTML)
+
+
 # ---------------- /trade (premium only) ----------------
 
 async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2420,12 +2509,18 @@ async def channel_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         text = {
             "not_available": "❌ This card is no longer available.",
             "own_listing": "⛔ You can't buy your own card.",
-            "insufficient_funds": f"💸 You don't have enough {config.CURRENCY_SYMBOL} for this card.",
+            "insufficient_funds": f"💸 You don't have enough {config.TTTP_SYMBOL} / {config.CURRENCY_SYMBOL} for this card.",
         }.get(reason, "❌ Purchase failed.")
         await query.answer(text, show_alert=True)
         return
 
-    await query.answer("✅ Purchased! The card is now in your collection.", show_alert=True)
+    paid_parts = []
+    if result.get("paid_tttp"):
+        paid_parts.append(f"{result['paid_tttp']} {config.TTTP_SYMBOL}")
+    if result.get("paid_vy"):
+        paid_parts.append(f"{result['paid_vy']} {config.CURRENCY_SYMBOL}")
+    paid_text = f" Paid: {' + '.join(paid_parts)}." if paid_parts else ""
+    await query.answer(f"✅ Purchased! The card is now in your collection.{paid_text}", show_alert=True)
 
     character = db.get_character(result["character_id"])
     if character:
@@ -3543,6 +3638,9 @@ async def _finalize_add_flow(pending_id: str, context: ContextTypes.DEFAULT_TYPE
             )
         if event_was_dropped:
             result += f"\n⚠️ Event \"{pending['event_name']}\" isn't registered - added without an event."
+        award = award_artist_tttp(pending["user_id"], rarity_name)
+        if award:
+            result += "\n\n" + _tttp_reward_text(award)
         await respond(result)
 
         character = db.get_character(char_id)
@@ -5180,6 +5278,19 @@ async def submission_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     if event_was_dropped:
         caption += f"\n⚠️ Event \"{html.escape(submission['event_name'])}\" isn't registered - added without an event."
+    award = award_artist_tttp(submission["sender_user_id"], rarity_name)
+    if award:
+        sender_name = html.escape(db.get_display_name(submission["sender_user_id"]))
+        caption += f"\n\n🎨 {sender_name} earned +{award[0]} {config.TTTP_SYMBOL}"
+        try:
+            await context.bot.send_message(
+                submission["sender_user_id"],
+                f"✅ Your submission <b>{html.escape(submission['name'])}</b> was added as #{char_id}.\n\n"
+                + _tttp_reward_text(award),
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass  # they may have never started the bot in DM
     caption += f"\n\n👤 Approved by {_mention(user.id, user.first_name)}"
 
     # Close the panel everywhere - the one that was pressed and its copies in the other
@@ -6075,8 +6186,9 @@ _HELP_PLAYER = [
     (_cmd("/prices"),
      "See the current price range for every rarity, with a button showing how much each event tier adds."),
     (_cmd("/memories"), "See a timeline of your milestones - first cards, rarity counts, and monthly gifts."),
-    (_cmd("/top"), "Leaderboards: the richest players (/top vy) and the biggest collections (/top collection)."),
+    (_cmd("/top"), "Leaderboards: the richest players (/top vy), the top artists (/top tttp) and the biggest collections (/top collection)."),
     (_cmd("/premium"), "Check your premium status and perks."),
+    (_cmd("/http"), "Everything about tttp, the artist currency, and the daily premium it unlocks."),
     (_cmd("/trade [ID]"), "Premium only - trade a card in for a random other character of the same rarity."),
     (_cmd("/search [term]"), "Find characters by name, series, or rarity - shows results as a photo gallery."),
     (_cmd("/gallery"), "Browse every character in the database as a photo gallery."),
@@ -6086,7 +6198,7 @@ _HELP_PLAYER = [
     (_cmd("/dart"),
      f"Throw a dart for a chance to win currency (up to {config.DAILY_DART_LIMIT} throws/day, resets at midnight Iran time)."),
     (_cmd("/inv"), "Check your currency balance."),
-    (_cmd("/vypay [amount]"), "Reply to someone with this to send them some of your currency."),
+    (_cmd("/vypay [amount] [vy|tttp]"), "Reply to someone with this to send them some of your currency (vy by default)."),
     (_cmd("/invite"),
      "Get your personal invite link - earn currency (and eventually a bonus + a 🌙Nocturne card) "
      "for every friend who joins through it."),
@@ -6393,6 +6505,7 @@ def main():
     threading.Thread(target=run_api_server, daemon=True).start()
     threading.Thread(target=economy.run_price_update_loop, daemon=True).start()
     threading.Thread(target=memories.run_nightly_engagement_loop, daemon=True).start()
+    threading.Thread(target=tttp.run_premium_loop, daemon=True).start()
 
     app = ApplicationBuilder().token(config.BOT_TOKEN).build()
     _install_personal_button_guard()
@@ -6516,6 +6629,7 @@ def main():
     app.add_handler(CommandHandler("setpremium", set_premium_command))
     app.add_handler(CommandHandler("removepremium", remove_premium_command))
     app.add_handler(CommandHandler("premium", premium_command))
+    app.add_handler(CommandHandler("http", http_command))
     app.add_handler(CommandHandler("trade", trade_command))
     app.add_handler(CallbackQueryHandler(trade_callback, pattern=r"^trade:"))
     app.add_handler(CommandHandler("sell", sell_command))

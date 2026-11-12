@@ -128,7 +128,7 @@ def list_listings():
 
 @api_app.get("/api/market/balance")
 def get_balance(user: dict = Depends(current_user)):
-    return {"balance": db.get_currency(user["id"])}
+    return {"balance": db.get_currency(user["id"]), "tttp": db.get_tttp(user["id"])}
 
 
 @api_app.get("/api/market/profile")
@@ -165,6 +165,7 @@ def get_profile(user: dict = Depends(current_user)):
     return {
         "name": display_name,
         "balance": db.get_currency(user["id"]),
+        "tttp": db.get_tttp(user["id"]),
         "card_count": len(inventory),
         "cards": [grouped[cid] for cid in order],
         "is_premium": db.is_premium(user["id"]),

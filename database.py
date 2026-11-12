@@ -16,7 +16,7 @@ from config import (
     FIGHTER_MAX_LEVEL, ARENA_BATTLE_DURATION_SECONDS, ARENA_LEAGUES,
     ARENA_MATCH_UP_CHANCE, ARENA_MATCH_DOWN_CHANCE, ARENA_NPC_OPPONENTS,
     ARENA_NPC_IDS, DAILY_TASK_BONUS, PREMIUM_DAILY_TASK_BONUS,
-    PRICE_CHECK_DEDUP_WINDOW_SECONDS, ADMIN_TYPE_BUNDLES,
+    PRICE_CHECK_DEDUP_WINDOW_SECONDS, ADMIN_TYPE_BUNDLES, TTTP_VALUE_IN_VY,
 )
 
 
@@ -168,6 +168,28 @@ def init_db():
             currency_totals_just_added = True
         except sqlite3.OperationalError:
             pass
+
+    # tttp (artist currency): a second balance on the same row, plus the
+    # per-day earnings log the "10 tttp a day = 24h premium" rule reads.
+    try:
+        cur.execute("ALTER TABLE currency ADD COLUMN tttp_balance INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tttp_daily_earned (
+            user_id INTEGER NOT NULL,
+            earn_date TEXT NOT NULL,
+            amount INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, earn_date)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tttp_premium_runs (
+            run_date TEXT PRIMARY KEY,
+            ran_at TEXT
+        )
+    """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS daily_darts (
@@ -2538,6 +2560,191 @@ def add_currency(user_id: int, amount: int) -> int:
     return row["balance"]
 
 
+# ---------------- tttp (artist currency) ----------------
+# tttp lives in currency.tttp_balance next to the normal VY balance.
+# 1 tttp == TTTP_VALUE_IN_VY VY. Spending rule (see plan_payment): tttp
+# first, VY for whatever tttp can't cover.
+
+def plan_payment(vy_balance: int, tttp_balance: int, price_vy: int):
+    """
+    Works out how a buyer pays `price_vy`. Returns (tttp_used, vy_used), or
+    None if they can't afford it. tttp is used first, in whole units; the
+    remainder (less than one tttp's worth) is paid in VY. If the remainder
+    can't be paid in VY but the buyer still has a spare tttp, that one extra
+    tttp covers it (no change is given back).
+    """
+    vy_balance = vy_balance or 0
+    tttp_balance = tttp_balance or 0
+    tttp_used = min(tttp_balance, price_vy // TTTP_VALUE_IN_VY)
+    remainder = price_vy - tttp_used * TTTP_VALUE_IN_VY
+    if remainder <= 0:
+        return tttp_used, 0
+    if vy_balance >= remainder:
+        return tttp_used, remainder
+    if tttp_balance - tttp_used >= 1:
+        return tttp_used + 1, 0
+    return None
+
+
+def get_tttp(user_id: int) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT tttp_balance FROM currency WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return (row["tttp_balance"] or 0) if row else 0
+
+
+def add_tttp(user_id: int, amount: int) -> int:
+    """Adds (or, if negative, removes) tttp and returns the new balance."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO currency (user_id, balance, tttp_balance) VALUES (?, 0, ?)
+        ON CONFLICT(user_id) DO UPDATE SET tttp_balance = COALESCE(tttp_balance, 0) + excluded.tttp_balance
+    """, (user_id, amount))
+    conn.commit()
+    cur.execute("SELECT tttp_balance FROM currency WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row["tttp_balance"]
+
+
+def transfer_tttp(sender_id: int, receiver_id: int, amount: int):
+    """Atomic tttp transfer. Returns the sender's remaining tttp, or None if
+    they don't have enough (nothing changes in that case)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("SELECT tttp_balance FROM currency WHERE user_id = ?", (sender_id,))
+        row = cur.fetchone()
+        sender_balance = (row["tttp_balance"] or 0) if row else 0
+        if sender_balance < amount:
+            return None
+        cur.execute("UPDATE currency SET tttp_balance = tttp_balance - ? WHERE user_id = ?", (amount, sender_id))
+        cur.execute("""
+            INSERT INTO currency (user_id, balance, tttp_balance) VALUES (?, 0, ?)
+            ON CONFLICT(user_id) DO UPDATE SET tttp_balance = COALESCE(tttp_balance, 0) + excluded.tttp_balance
+        """, (receiver_id, amount))
+        conn.commit()
+        cur.execute("SELECT tttp_balance FROM currency WHERE user_id = ?", (sender_id,))
+        return cur.fetchone()["tttp_balance"]
+    finally:
+        conn.close()
+
+
+def get_top_tttp(limit: int = 10):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT user_id, tttp_balance
+        FROM currency
+        WHERE tttp_balance > 0
+        ORDER BY tttp_balance DESC
+        LIMIT ?
+    """, (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def reward_tttp_for_card(user_id: int, amount: int):
+    """
+    Pays an admin the tttp reward for a card they added AND logs it in
+    today's (Iran-time) earnings, in one transaction. Returns
+    (new_balance, earned_today_total).
+    """
+    today = iran_today()
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("""
+            INSERT INTO currency (user_id, balance, tttp_balance) VALUES (?, 0, ?)
+            ON CONFLICT(user_id) DO UPDATE SET tttp_balance = COALESCE(tttp_balance, 0) + excluded.tttp_balance
+        """, (user_id, amount))
+        cur.execute("""
+            INSERT INTO tttp_daily_earned (user_id, earn_date, amount) VALUES (?, ?, ?)
+            ON CONFLICT(user_id, earn_date) DO UPDATE SET amount = amount + excluded.amount
+        """, (user_id, today, amount))
+        conn.commit()
+        cur.execute("SELECT tttp_balance FROM currency WHERE user_id = ?", (user_id,))
+        balance = cur.fetchone()["tttp_balance"]
+        cur.execute("SELECT amount FROM tttp_daily_earned WHERE user_id = ? AND earn_date = ?", (user_id, today))
+        today_total = cur.fetchone()["amount"]
+        return balance, today_total
+    finally:
+        conn.close()
+
+
+def get_tttp_earners(earn_date: str, minimum: int):
+    """[(user_id, amount)] of everyone who earned at least `minimum` tttp from cards on that Iran date."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, amount FROM tttp_daily_earned WHERE earn_date = ? AND amount >= ?",
+        (earn_date, minimum),
+    )
+    rows = [(row["user_id"], row["amount"]) for row in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def tttp_premium_run_done(run_date: str) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM tttp_premium_runs WHERE run_date = ?", (run_date,))
+    done = cur.fetchone() is not None
+    conn.close()
+    return done
+
+
+def mark_tttp_premium_run(run_date: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO tttp_premium_runs (run_date, ran_at) VALUES (?, ?)",
+        (run_date, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def grant_premium_until(user_id: int, expires_at_utc: datetime) -> bool:
+    """
+    Gives premium until `expires_at_utc` (naive UTC, like the rest of the
+    premium table) but NEVER shortens existing premium: permanent premium
+    (no expiry) and anything that already lasts longer are left alone.
+    Returns True if premium was granted/extended.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT expires_at FROM premium_users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    now = datetime.utcnow()
+    if row:
+        if row["expires_at"] is None:
+            conn.close()
+            return False
+        current_expiry = datetime.fromisoformat(row["expires_at"])
+        if current_expiry >= expires_at_utc:
+            conn.close()
+            return False
+        if current_expiry > now:  # still active - just extend it
+            cur.execute("UPDATE premium_users SET expires_at = ? WHERE user_id = ?",
+                        (expires_at_utc.isoformat(), user_id))
+        else:
+            cur.execute("UPDATE premium_users SET granted_at = ?, expires_at = ? WHERE user_id = ?",
+                        (now.isoformat(), expires_at_utc.isoformat(), user_id))
+    else:
+        cur.execute("INSERT INTO premium_users (user_id, granted_at, expires_at) VALUES (?, ?, ?)",
+                    (user_id, now.isoformat(), expires_at_utc.isoformat()))
+    conn.commit()
+    conn.close()
+    return True
+
+
 # ---------------- Invite / referral system ----------------
 # Reward doubles each successful invite (5, 10, 20, 40, 80, 160), capping
 # at 160 - every invite after that still pays 160, just without doubling
@@ -4031,17 +4238,24 @@ def buy_listing(listing_id: int, buyer_id: int, buyer_username: str):
         if buyer_id == seller_id:
             return {"ok": False, "reason": "own_listing"}
 
-        cur.execute("SELECT balance FROM currency WHERE user_id = ?", (buyer_id,))
+        cur.execute("SELECT balance, tttp_balance FROM currency WHERE user_id = ?", (buyer_id,))
         row = cur.fetchone()
-        buyer_balance = row["balance"] if row else 0
-        if buyer_balance < price:
+        buyer_vy = row["balance"] if row else 0
+        buyer_tttp = (row["tttp_balance"] or 0) if row else 0
+        payment = plan_payment(buyer_vy, buyer_tttp, price)  # tttp first, VY for the rest
+        if payment is None:
             return {"ok": False, "reason": "insufficient_funds"}
+        tttp_used, vy_used = payment
 
-        cur.execute("""
-            INSERT INTO currency (user_id, balance) VALUES (?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET balance = balance - excluded.balance
-        """, (buyer_id, price))
-        _track_currency_delta(cur, buyer_id, -price)
+        if tttp_used:
+            cur.execute("UPDATE currency SET tttp_balance = tttp_balance - ? WHERE user_id = ?",
+                        (tttp_used, buyer_id))
+        if vy_used:
+            cur.execute("UPDATE currency SET balance = balance - ? WHERE user_id = ?",
+                        (vy_used, buyer_id))
+        # tasks that track spending count it in VY-equivalent
+        _track_currency_delta(cur, buyer_id, -(tttp_used * TTTP_VALUE_IN_VY + vy_used))
+        # the seller is always paid the full listing price in VY
         cur.execute("""
             INSERT INTO currency (user_id, balance) VALUES (?, ?)
             ON CONFLICT(user_id) DO UPDATE SET balance = balance + excluded.balance
@@ -4066,6 +4280,8 @@ def buy_listing(listing_id: int, buyer_id: int, buyer_username: str):
             "character_id": listing["character_id"],
             "price": price,
             "seller_id": seller_id,
+            "paid_tttp": tttp_used,
+            "paid_vy": vy_used,
         }
     finally:
         conn.close()
