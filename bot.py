@@ -2206,8 +2206,8 @@ async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def http_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/http - explains the tttp artist currency and the daily premium."""
+async def tttp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tttp - explains the tttp artist currency and the daily premium."""
     await update.message.reply_text(tttp.format_info_message(), parse_mode=ParseMode.HTML)
 
 
@@ -6188,7 +6188,7 @@ _HELP_PLAYER = [
     (_cmd("/memories"), "See a timeline of your milestones - first cards, rarity counts, and monthly gifts."),
     (_cmd("/top"), "Leaderboards: the richest players (/top vy), the top artists (/top tttp) and the biggest collections (/top collection)."),
     (_cmd("/premium"), "Check your premium status and perks."),
-    (_cmd("/http"), "Everything about tttp, the artist currency, and the daily premium it unlocks."),
+    (_cmd("/tttp"), "Everything about tttp, the artist currency, and the daily premium it unlocks."),
     (_cmd("/trade [ID]"), "Premium only - trade a card in for a random other character of the same rarity."),
     (_cmd("/search [term]"), "Find characters by name, series, or rarity - shows results as a photo gallery."),
     (_cmd("/gallery"), "Browse every character in the database as a photo gallery."),
@@ -6333,7 +6333,9 @@ _HELP_OWNER_ONLY = [
 
 
 def _help_blocks(entries):
-    return [f"{header}\n{description}" for header, description in entries]
+    # Entries are (header, description), or (permission, header, description)
+    # for admin commands - the owner sees those lists unfiltered, so accept both.
+    return [f"{entry[-2]}\n{entry[-1]}" for entry in entries]
 
 
 def _help_section(title: str, *entry_lists) -> list:
@@ -6629,7 +6631,7 @@ def main():
     app.add_handler(CommandHandler("setpremium", set_premium_command))
     app.add_handler(CommandHandler("removepremium", remove_premium_command))
     app.add_handler(CommandHandler("premium", premium_command))
-    app.add_handler(CommandHandler("http", http_command))
+    app.add_handler(CommandHandler("tttp", tttp_command))
     app.add_handler(CommandHandler("trade", trade_command))
     app.add_handler(CallbackQueryHandler(trade_callback, pattern=r"^trade:"))
     app.add_handler(CommandHandler("sell", sell_command))
