@@ -32,6 +32,9 @@ def reward_for_rarity(rarity_name) -> int:
 def buy_price_for_rarity(rarity_name) -> int:
     """tttp cost of buying a card of this rarity with /buyt: the add-card reward
     x config.TTTP_BUY_MULTIPLIER (0 = not purchasable: unranked / custom rarity)."""
+    tier = economy.match_price_tier(rarity_name) if rarity_name else None
+    if tier in config.TTTP_BUY_PRICE_OVERRIDES:
+        return config.TTTP_BUY_PRICE_OVERRIDES[tier]
     return reward_for_rarity(rarity_name) * config.TTTP_BUY_MULTIPLIER
 
 

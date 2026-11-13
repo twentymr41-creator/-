@@ -131,6 +131,11 @@ TTTP_RARITY_REWARDS = {
 # for that card's rarity x this multiplier.
 TTTP_BUY_MULTIPLIER = 10
 
+# Fixed /buyt prices that replace "reward x multiplier" for specific tiers.
+TTTP_BUY_PRICE_OVERRIDES = {
+    "Aevoria": 70,
+}
+
 # An admin who earns at least this much tttp (from adding cards) during one
 # Iran-time day is given 24h premium at 00:00 Iran time. The cycle repeats
 # every night as long as they keep hitting the target.
