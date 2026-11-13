@@ -2669,6 +2669,41 @@ def transfer_tttp(sender_id: int, receiver_id: int, amount: int):
         conn.close()
 
 
+def buy_card_with_tttp(user_id: int, username: str, character_id: int, price: int):
+    """
+    Atomically charges `price` tttp (tttp only - never VY) and gives the buyer
+    one fresh copy of the card. Returns {"ok": True, "balance": new_balance} or
+    {"ok": False, "reason": "no_character" | "insufficient_tttp", "balance": n}.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")  # lock first so two quick /buyt can't both pass the balance check
+        cur.execute("SELECT id FROM characters WHERE id = ?", (character_id,))
+        if not cur.fetchone():
+            return {"ok": False, "reason": "no_character", "balance": 0}
+        cur.execute("SELECT tttp_balance FROM currency WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        balance = (row["tttp_balance"] or 0) if row else 0
+        if balance < price:
+            return {"ok": False, "reason": "insufficient_tttp", "balance": balance}
+        cur.execute("UPDATE currency SET tttp_balance = tttp_balance - ? WHERE user_id = ?", (price, user_id))
+        # tasks that track spending count it in VY-equivalent
+        _track_currency_delta(cur, user_id, -(price * TTTP_VALUE_IN_VY))
+        cur.execute(
+            "INSERT INTO user_characters (user_id, username, character_id, obtained_at) VALUES (?, ?, ?, ?)",
+            (user_id, username, character_id, datetime.utcnow().isoformat()),
+        )
+        _init_fighter_fields_if_applicable(cur, cur.lastrowid, character_id)
+        conn.commit()
+        return {"ok": True, "balance": balance - price}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_top_tttp(limit: int = 10):
     conn = get_connection()
     cur = conn.cursor()

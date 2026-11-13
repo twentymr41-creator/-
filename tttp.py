@@ -29,6 +29,12 @@ def reward_for_rarity(rarity_name) -> int:
     return config.TTTP_RARITY_REWARDS.get(tier, 0) if tier else 0
 
 
+def buy_price_for_rarity(rarity_name) -> int:
+    """tttp cost of buying a card of this rarity with /buyt: the add-card reward
+    x config.TTTP_BUY_MULTIPLIER (0 = not purchasable: unranked / custom rarity)."""
+    return reward_for_rarity(rarity_name) * config.TTTP_BUY_MULTIPLIER
+
+
 def format_info_message() -> str:
     lines = [
         "🎨 <b>tttp — the Artist Currency</b>\n",
@@ -53,6 +59,10 @@ def format_info_message() -> str:
         f"<code>/vypay [amount] {config.TTTP_SYMBOL}</code>, "
         f"<code>/player</code>, <code>/inv</code> and "
         f"<code>/top {config.TTTP_SYMBOL}</code>.\n",
+        "<b>Buying cards with tttp (admins only)</b>",
+        f"<code>/buyt [card ID]</code> buys a card using only {config.TTTP_SYMBOL}. "
+        f"The price is the card's reward above x {config.TTTP_BUY_MULTIPLIER} "
+        f"(e.g. a Common card costs {config.TTTP_RARITY_REWARDS.get('Common', 1) * config.TTTP_BUY_MULTIPLIER} {config.TTTP_SYMBOL}).\n",
         "<b>How is it spent?</b>",
         f"When you buy something, your {config.TTTP_SYMBOL} is used first. "
         f"Whatever it can't cover is taken from your {config.CURRENCY_SYMBOL}. "

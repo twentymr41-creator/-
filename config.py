@@ -127,6 +127,10 @@ TTTP_RARITY_REWARDS = {
     "Omnara": 15,
 }
 
+# /buyt: an admin can buy any card with tttp only. Price = the tttp reward
+# for that card's rarity x this multiplier.
+TTTP_BUY_MULTIPLIER = 5
+
 # An admin who earns at least this much tttp (from adding cards) during one
 # Iran-time day is given 24h premium at 00:00 Iran time. The cycle repeats
 # every night as long as they keep hitting the target.

@@ -2206,6 +2206,73 @@ async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def buyt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/buyt [card ID] - admins only: buy a card with tttp. Price = the tttp
+    reward of the card's rarity x config.TTTP_BUY_MULTIPLIER."""
+    user = update.effective_user
+    if not _is_any_admin(user.id):
+        await update.message.reply_text("⛔ Only admins can use /buyt.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            f"⚠️ Usage: <code>/buyt [card ID]</code>\nExample: <code>/buyt 30</code>\n"
+            f"Buys the card with {config.TTTP_SYMBOL}. Price = the {config.TTTP_SYMBOL} you earn for adding that "
+            f"rarity x {config.TTTP_BUY_MULTIPLIER}.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        char_id = int(context.args[0].lstrip("#"))
+    except ValueError:
+        await update.message.reply_text("⚠️ ID must be a number.")
+        return
+
+    character = db.get_character(char_id)
+    if not character:
+        await update.message.reply_text(f"❓ No character found with ID #{char_id}.")
+        return
+
+    rarity_display = character["rarity_name"] if character["rarity_name"] else "Unranked"
+    price = tttp.buy_price_for_rarity(character["rarity_name"])
+    if price <= 0:
+        await update.message.reply_text(
+            f"❌ <b>{html.escape(rarity_display)}</b> cards can't be bought with {config.TTTP_SYMBOL}.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    db.upsert_user_profile(user.id, username=user.username,
+                           first_name=user.first_name, last_name=user.last_name)
+    result = db.buy_card_with_tttp(user.id, user.username or user.first_name, char_id, price)
+
+    if not result["ok"]:
+        if result["reason"] == "insufficient_tttp":
+            await update.message.reply_text(
+                f"💸 Not enough {config.TTTP_SYMBOL}. This card costs <b>{price} {config.TTTP_SYMBOL}</b>, "
+                f"you have <b>{result['balance']} {config.TTTP_SYMBOL}</b>.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.message.reply_text(f"❓ No character found with ID #{char_id}.")
+        return
+
+    await send_character_result(
+        context, update.effective_chat.id, character,
+        f"✅ You bought <b>{html.escape(character['name'])}</b> (#{char_id}, {html.escape(rarity_display)}) "
+        f"for <b>{price} {config.TTTP_SYMBOL}</b>.\n"
+        f"🎨 Remaining balance: <b>{result['balance']} {config.TTTP_SYMBOL}</b>",
+        reply_to_message_id=update.message.message_id,
+    )
+
+    for msg in memories.record_acquisition(user.id, character, "market_buy"):
+        try:
+            await context.bot.send_message(user.id, msg, parse_mode=ParseMode.HTML)
+        except TelegramError:
+            pass
+
+
 async def tttp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/tttp - explains the tttp artist currency and the daily premium."""
     await update.message.reply_text(tttp.format_info_message(), parse_mode=ParseMode.HTML)
@@ -6371,6 +6438,13 @@ def build_help_text(user_id: int) -> str:
                 if entries:
                     blocks += _help_section(title, entries)
 
+    if _is_any_admin(user_id):
+        blocks += _help_section("Artist currency", [(
+            _cmd("/buyt [ID]"),
+            f"Admins only - buy a card with {config.TTTP_SYMBOL}. Price = the {config.TTTP_SYMBOL} you earn for "
+            f"adding that rarity x {config.TTTP_BUY_MULTIPLIER}.",
+        )])
+
     return "\n\n".join(blocks)
 
 
@@ -6661,6 +6735,7 @@ def main():
     app.add_handler(CommandHandler("removepremium", remove_premium_command))
     app.add_handler(CommandHandler("premium", premium_command))
     app.add_handler(CommandHandler("tttp", tttp_command))
+    app.add_handler(CommandHandler("buyt", buyt_command))
     app.add_handler(CommandHandler("trade", trade_command))
     app.add_handler(CallbackQueryHandler(trade_callback, pattern=r"^trade:"))
     app.add_handler(CommandHandler("sell", sell_command))
