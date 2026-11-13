@@ -39,6 +39,7 @@ import chat_ai
 import database as db
 import memories
 import market_channel
+import tttp
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +248,13 @@ class BuyRequest(BaseModel):
 async def buy(payload: BuyRequest, user: dict = Depends(current_user)):
     username = user.get("username") or user.get("first_name")
     result = db.buy_listing(payload.listing_id, user["id"], username)
+    if not result["ok"] and result["reason"] == "needs_tttp":
+        # not enough VY but enough tttp: the bot DMs the buyer a Yes/No prompt
+        await asyncio.to_thread(
+            tttp.send_shop_confirm_dm, user["id"], payload.listing_id,
+            result["price"], result["buyer_vy"], result["buyer_tttp"],
+        )
+        raise HTTPException(status_code=400, detail="needs_tttp_confirmation")
     if not result["ok"]:
         status = 409 if result["reason"] in ("not_available", "own_listing") else 400
         raise HTTPException(status_code=status, detail=result["reason"])

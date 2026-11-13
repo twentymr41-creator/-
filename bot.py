@@ -2573,6 +2573,19 @@ async def channel_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not result["ok"]:
         reason = result["reason"]
+        if reason == "needs_tttp":
+            # not enough VY, but their tttp could cover it: ask them in DM first
+            sent = await asyncio.to_thread(
+                tttp.send_shop_confirm_dm, buyer.id, listing_id,
+                result["price"], result["buyer_vy"], result["buyer_tttp"],
+            )
+            await query.answer(
+                f"💸 Not enough {config.CURRENCY_SYMBOL}. I sent you a private message asking if you want to pay with {config.TTTP_SYMBOL}."
+                if sent else
+                f"💸 Not enough {config.CURRENCY_SYMBOL}. Start the bot in private chat so I can ask about paying with {config.TTTP_SYMBOL}.",
+                show_alert=True,
+            )
+            return
         text = {
             "not_available": "❌ This card is no longer available.",
             "own_listing": "⛔ You can't buy your own card.",
@@ -2597,6 +2610,56 @@ async def channel_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             except TelegramError:
                 pass
 
+    await asyncio.to_thread(market_channel.mark_sold, listing_id, buyer.id, buyer)
+
+
+async def shop_tttp_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Yes / No under the "pay with tttp instead?" DM (see tttp.send_shop_confirm_dm)."""
+    query = update.callback_query
+    parts = query.data.split(":")  # chbuytttp:<ok|no>:<listing_id>:<buyer_id>
+    action, listing_id, buyer_id = parts[1], int(parts[2]), int(parts[3])
+    buyer = query.from_user
+
+    if buyer.id != buyer_id:
+        await query.answer("This isn't for you.", show_alert=True)
+        return
+    if not await _consume_buttons(query):  # double tap
+        await query.answer()
+        return
+    await query.answer()
+
+    if action == "no":
+        await _edit_text_or_caption(query, "❌ Purchase cancelled.")
+        return
+
+    db.upsert_user_profile(buyer.id, username=buyer.username,
+                           first_name=buyer.first_name, last_name=buyer.last_name)
+    result = db.buy_listing(listing_id, buyer.id, buyer.username or buyer.first_name, allow_tttp=True)
+    if not result["ok"]:
+        text = {
+            "not_available": "❌ This card is no longer available.",
+            "own_listing": "⛔ You can't buy your own card.",
+            "insufficient_funds": f"💸 You no longer have enough {config.TTTP_SYMBOL} / {config.CURRENCY_SYMBOL} for this card.",
+        }.get(result["reason"], "❌ Purchase failed.")
+        await _edit_text_or_caption(query, text)
+        return
+
+    paid_parts = []
+    if result.get("paid_tttp"):
+        paid_parts.append(f"{result['paid_tttp']} {config.TTTP_SYMBOL}")
+    if result.get("paid_vy"):
+        paid_parts.append(f"{result['paid_vy']} {config.CURRENCY_SYMBOL}")
+    await _edit_text_or_caption(
+        query, f"✅ Purchased! The card is now in your collection. Paid: {' + '.join(paid_parts)}.",
+    )
+
+    character = db.get_character(result["character_id"])
+    if character:
+        for msg in memories.record_acquisition(buyer.id, character, "market_buy"):
+            try:
+                await context.bot.send_message(buyer.id, msg, parse_mode=ParseMode.HTML)
+            except TelegramError:
+                pass
     await asyncio.to_thread(market_channel.mark_sold, listing_id, buyer.id, buyer)
 
 
@@ -6744,6 +6807,7 @@ def main():
     app.add_handler(CommandHandler("setsellprice", set_sell_price_command))
     app.add_handler(CallbackQueryHandler(cancelsell_button_callback, pattern=r"^cancelsell:"))
     app.add_handler(CallbackQueryHandler(channel_buy_callback, pattern=r"^chbuy:\d+$"))
+    app.add_handler(CallbackQueryHandler(shop_tttp_confirm_callback, pattern=r"^chbuytttp:"))
     app.add_handler(CallbackQueryHandler(sellbot_callback, pattern=r"^sellbot:"))
     app.add_handler(CommandHandler("market", market_command))
     app.add_handler(CallbackQueryHandler(market_page_callback, pattern=r"^marketpage:"))

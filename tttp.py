@@ -140,3 +140,34 @@ def run_premium_loop():
         except Exception:
             logger.exception("tttp premium cycle failed")
         time.sleep(300)
+
+
+# ---------------- shop purchase: "use tttp instead?" prompt ----------------
+
+def send_shop_confirm_dm(buyer_id: int, listing_id: int, price: int, buyer_vy: int, buyer_tttp: int) -> bool:
+    """
+    DMs the buyer when their VY can't cover a shop card but their tttp could:
+    asks whether to pay with tttp, with Yes / No buttons. Blocking (urllib) -
+    call it via asyncio.to_thread. Returns False if Telegram refused (e.g. the
+    buyer never started the bot).
+    """
+    text = (
+        f"💸 You don't have enough {config.CURRENCY_SYMBOL} for this card.\n"
+        f"Price: <b>{price} {config.CURRENCY_SYMBOL}</b> · "
+        f"You have: <b>{buyer_vy} {config.CURRENCY_SYMBOL}</b> and <b>{buyer_tttp} {config.TTTP_SYMBOL}</b>\n\n"
+        f"🎨 Pay with your {config.TTTP_SYMBOL} instead?"
+    )
+    keyboard = {"inline_keyboard": [[
+        {"text": "✅ Yes", "callback_data": f"chbuytttp:ok:{listing_id}:{buyer_id}"},
+        {"text": "❌ No", "callback_data": f"chbuytttp:no:{listing_id}:{buyer_id}"},
+    ]]}
+    url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage"
+    data = json.dumps({"chat_id": buyer_id, "text": text, "parse_mode": "HTML",
+                       "reply_markup": keyboard}).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(request, timeout=10)
+        return True
+    except Exception:
+        logger.warning("Could not DM the shop tttp confirmation to %s", buyer_id)
+        return False

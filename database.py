@@ -4286,12 +4286,18 @@ def cancel_active_listings(character_id: int = None):
     return ids
 
 
-def buy_listing(listing_id: int, buyer_id: int, buyer_username: str):
+def buy_listing(listing_id: int, buyer_id: int, buyer_username: str, allow_tttp: bool = False):
     """
     Buys an active listing: moves currency buyer -> seller, moves the
     specific card copy buyer's way, and marks the listing sold - all in
     one transaction, so a crash mid-purchase can't charge someone
     without handing over the card (or vice versa).
+
+    Normal purchases are paid in VY only, even if the buyer holds tttp. If the
+    VY isn't enough but their tttp would cover the rest, nothing is charged and
+    {"ok": False, "reason": "needs_tttp", ...} comes back so the caller can ask
+    the buyer to confirm; the confirmed retry passes allow_tttp=True (tttp is
+    spent first, VY for whatever tttp can't cover).
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -4312,7 +4318,15 @@ def buy_listing(listing_id: int, buyer_id: int, buyer_username: str):
         row = cur.fetchone()
         buyer_vy = row["balance"] if row else 0
         buyer_tttp = (row["tttp_balance"] or 0) if row else 0
-        payment = plan_payment(buyer_vy, buyer_tttp, price)  # tttp first, VY for the rest
+        if buyer_vy >= price:
+            payment = (0, price)  # enough VY: always pay in VY, tttp stays untouched
+        elif allow_tttp:
+            payment = plan_payment(buyer_vy, buyer_tttp, price)  # tttp first, VY for the rest
+        else:
+            if plan_payment(buyer_vy, buyer_tttp, price) is not None:
+                return {"ok": False, "reason": "needs_tttp", "price": price,
+                        "buyer_vy": buyer_vy, "buyer_tttp": buyer_tttp}
+            payment = None
         if payment is None:
             return {"ok": False, "reason": "insufficient_funds"}
         tttp_used, vy_used = payment
